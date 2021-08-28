@@ -34,13 +34,27 @@ const char outLabels[][5] = {"OUT1", "OUT2"};
 #define USER_EMAIL "xxxxxxxx@email.email"
 #define USER_PASSWORD "xxxxxxxxxxxxxxxxx"
 
+
 // Define FirebaseESP8266 data object
 FirebaseData fbdo1;
-FirebaseData fbdo2;
 
 FirebaseAuth auth;
 FirebaseConfig config;
 const char* path = "/esp-stream";
+
+
+// Web server handlers
+void handleNotFound() {
+    String msg = server.uri();
+    msg += " not found.";
+    server.send(404, "text/plain", msg);    
+}
+
+// Send homepage (loaded from flash memory) to client
+void handleHomePage() {
+  server.sendHeader(F("Content-Encoding"), "gzip");
+  server.send(200, "text/html", WEBPAGE_HTML, WEBPAGE_HTML_SIZE);
+}
 
 void updateGpioList() {
     String jsonStr;
@@ -65,9 +79,9 @@ void updateGpioList() {
         gpios.set(key, gpio);
     }
     if(Firebase.ready()) {
-      if (!Firebase.RTDB.setJSONAsync(&fbdo2, path, &gpios)) {
+      if (!Firebase.RTDB.setJSONAsync(&fbdo1, path, &gpios)) {
         Serial.println("FAILED");
-        Serial.println("REASON: " + fbdo2.errorReason());      
+        Serial.println("REASON: " + fbdo1.errorReason());      
         Serial.println();
       }
     }
@@ -76,7 +90,7 @@ void updateGpioList() {
 
 bool updateGpioState(){
   // With this variable, we will check if some of defined gpios has changed
-  uint16_t gpioState;
+  uint16_t gpioState = 0;
   static uint16_t gpioLast;
   size_t pos = 0;
   for (uint8_t i=0; i < sizeof(inputs); i++) {
@@ -93,7 +107,7 @@ bool updateGpioState(){
 }
 
 
-
+// This is the callback function called when stream from firebase was received
 void streamCallback(FirebaseStream data) {
     Serial.println("\nStream Data1 available...");
     Serial.println("STREAM PATH: " + data.streamPath());
@@ -103,36 +117,42 @@ void streamCallback(FirebaseStream data) {
     
     if (data.dataType() == "json") {
         FirebaseJson &json = data.jsonObject();
-        size_t len = json.iteratorBegin();
+        
         String key, value = "";
         int type = 0;
-        Pin pin;
+        SetPin setPin;
+      
+        // Iterate the JSON data in order to parse all keys and values
+        size_t len = json.iteratorBegin();
         for (size_t i = 0; i < len; i++) {
+            // Get all key:value combination for this JSON event
             json.iteratorGet(i, type, key, value);
-            //Serial.printf("\"%s\":\"%s\"\n", key.c_str(), value.c_str());            
+
+            // With string values, we have unwanted " chars.
+            value.replace('\"', ' ');
+            value.trim();
+            //Serial.printf("\"%s\":\"%s\"\n", key.c_str(), value.c_str());  
+
+            // If this is a "writeOut" command, set the pin structure ready to be valorized
             if(key.equals("cmd") && value.equals("writeOut")) {
-                pin.en = true;
+                setPin.en = true;
+                Serial.println("cmd: writeOut");
             }
-            // writeOut command received, set the pin structure ready to be valorized
-            if(pin.en) { 
-              if(key.equals("pin"))
-                pin.pin = value.toInt();
-              if(key.equals("level"))
-                pin.level = value.equals("true") ? 1 : 0;
+            
+            // If true, we are parsing a "writeOut" command
+            if(setPin.en) {               
+              if(key.equals("pin"))   setPin.pin = value.toInt();
+              if(key.equals("level")) setPin.level = value.equals("true") ? 1 : 0;
 
               // All variables valorized with parsed values, set output and clear pin structure
-              if(pin.level > -1 && pin.pin > -1) {
-                Serial.printf("Set output pin %d: %d\n", pin.pin, pin.level);
-                digitalWrite(pin.pin, pin.level);
-                pin.en = false;
-                pin.pin = -1;
-                pin.level = -1;
+              if(setPin.level > -1 && setPin.pin > -1) {
+                Serial.printf("Set output pin %d: %d\n", setPin.pin, setPin.level);
+                digitalWrite(setPin.pin, setPin.level);
               }
             }
         }
         json.iteratorEnd();
     }
-   
 }
 
 void streamTimeoutCallback(bool timeout)
@@ -186,14 +206,6 @@ void setup() {
   //Set the size of HTTP response buffers in the case where we want to work with large data.
   fbdo1.setResponseSize(1024);
 
-#if defined(ESP8266)
-  //Set the size of WiFi rx/tx buffers in the case where we want to work with large data.
-  fbdo2.setBSSLBufferSize(1024, 1024);
-#endif
-
-  //Set the size of HTTP response buffers in the case where we want to work with large data.
-  fbdo2.setResponseSize(1024);
-
   //The data under the node being stream (parent path) should keep small
   //Large stream payload leads to the parsing error due to memory allocation.
   if (!Firebase.RTDB.beginStream(&fbdo1, path)) {
@@ -203,10 +215,17 @@ void setup() {
   }
   
   Firebase.RTDB.setStreamCallback(&fbdo1, streamCallback, streamTimeoutCallback);
+
+  server.on("/", HTTP_GET, handleHomePage);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  
   updateGpioList();
 }
 
 void loop() {
+  server.handleClient();
+  
   if( updateGpioState()) {
     updateGpioList();
   }
